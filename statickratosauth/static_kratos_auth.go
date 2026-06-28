@@ -13,14 +13,14 @@ import (
 	"context"
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"maps"
 	"slices"
 
-	"github.com/go-kratos/kratos/v2/errors"
-	"github.com/go-kratos/kratos/v2/log"
-	"github.com/go-kratos/kratos/v2/middleware"
-	"github.com/go-kratos/kratos/v2/middleware/selector"
-	"github.com/go-kratos/kratos/v2/transport"
+	"github.com/go-kratos/kratos/v3/errors"
+	"github.com/go-kratos/kratos/v3/middleware"
+	"github.com/go-kratos/kratos/v3/middleware/selector"
+	"github.com/go-kratos/kratos/v3/transport"
 	"github.com/yylego/kratos-auth/authkratos"
 	"github.com/yylego/kratos-static-auth/internal/utils"
 	"github.com/yylego/must"
@@ -182,22 +182,21 @@ func (c *Config) RandomBase64Token() string {
 //
 // NewMiddleware 使用配置和日志创建认证中间件
 // 使用 selector.Server 匹配路由并检查认证令牌
-func NewMiddleware(cfg *Config, logger log.Logger) middleware.Middleware {
-	slog := log.NewHelper(logger)
-	slog.Infof(
-		"static-kratos-auth: new middleware field-name=%v auth-tokens=%d side=%v operations=%d simple-enable=%v bearer-enable=%v base64-enable=%v",
-		cfg.fieldName,
-		len(cfg.authTokens),
-		cfg.routeScope.Side,
-		len(cfg.routeScope.OperationSet),
-		authkratos.BooleanToNum(cfg.simpleEnable),
-		authkratos.BooleanToNum(cfg.bearerEnable),
-		authkratos.BooleanToNum(cfg.base64Enable),
+func NewMiddleware(cfg *Config, applog *slog.Logger) middleware.Middleware {
+	applog.Info(
+		"static-kratos-auth: new middleware",
+		"field-name", cfg.fieldName,
+		"auth-tokens", len(cfg.authTokens),
+		"side", cfg.routeScope.Side,
+		"operations", len(cfg.routeScope.OperationSet),
+		"simple-enable", authkratos.BooleanToNum(cfg.simpleEnable),
+		"bearer-enable", authkratos.BooleanToNum(cfg.bearerEnable),
+		"base64-enable", authkratos.BooleanToNum(cfg.base64Enable),
 	)
 	if cfg.debugMode {
-		slog.Debugf("static-kratos-auth: new middleware field-name=%v route-scope: %s", cfg.fieldName, neatjsons.S(cfg.routeScope))
+		applog.Debug("static-kratos-auth: new middleware route-scope", "field-name", cfg.fieldName, "route-scope", neatjsons.S(cfg.routeScope))
 	}
-	return selector.Server(middlewareFunc(cfg, logger)).Match(matchFunc(cfg, logger)).Build()
+	return selector.Server(middlewareFunc(cfg, applog)).Match(matchFunc(cfg, applog)).Build()
 }
 
 // matchFunc creates route matching function
@@ -205,9 +204,7 @@ func NewMiddleware(cfg *Config, logger log.Logger) middleware.Middleware {
 //
 // matchFunc 创建路由匹配函数
 // 操作需要认证时返回 true
-func matchFunc(cfg *Config, logger log.Logger) selector.MatchFunc {
-	slog := log.NewHelper(logger)
-
+func matchFunc(cfg *Config, applog *slog.Logger) selector.MatchFunc {
 	return func(ctx context.Context, operation string) bool {
 		// Start tracing spans via configured hooks
 		// 通过配置的 hooks 启动追踪 spans
@@ -216,9 +213,9 @@ func matchFunc(cfg *Config, logger log.Logger) selector.MatchFunc {
 		match := cfg.routeScope.Match(operation)
 		if cfg.debugMode {
 			if match {
-				slog.Debugf("static-kratos-auth: operation=%s side=%v match=%d next -> check auth", operation, cfg.routeScope.Side, authkratos.BooleanToNum(match))
+				applog.Debug("static-kratos-auth: match next -> check auth", "operation", operation, "side", cfg.routeScope.Side, "match", authkratos.BooleanToNum(match))
 			} else {
-				slog.Debugf("static-kratos-auth: operation=%s side=%v match=%d skip -- check auth", operation, cfg.routeScope.Side, authkratos.BooleanToNum(match))
+				applog.Debug("static-kratos-auth: match skip -- check auth", "operation", operation, "side", cfg.routeScope.Side, "match", authkratos.BooleanToNum(match))
 			}
 		}
 		return match
@@ -230,9 +227,7 @@ func matchFunc(cfg *Config, logger log.Logger) selector.MatchFunc {
 //
 // middlewareFunc 创建实际的认证中间件
 // 验证令牌并将用户名注入 context
-func middlewareFunc(cfg *Config, logger log.Logger) middleware.Middleware {
-	slog := log.NewHelper(logger)
-
+func middlewareFunc(cfg *Config, applog *slog.Logger) middleware.Middleware {
 	// Build token maps based on enabled types, init blank maps as default
 	// 根据启用的类型构建令牌映射，默认初始化空 map
 	mapBox := &authTokenMapBox{
@@ -260,14 +255,14 @@ func middlewareFunc(cfg *Config, logger log.Logger) middleware.Middleware {
 				var authToken = tsp.RequestHeader().Get(cfg.fieldName)
 				if authToken == "" {
 					if cfg.debugMode {
-						slog.Debugf("static-kratos-auth: auth-token is missing")
+						applog.Debug("static-kratos-auth: auth-token is missing")
 					}
 					return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: auth-token is missing")
 				}
-				username, erk := checkAuthToken(cfg, mapBox, authToken, slog)
+				username, erk := checkAuthToken(cfg, mapBox, authToken, applog)
 				if erk != nil {
 					if cfg.debugMode {
-						slog.Debugf("static-kratos-auth: auth-token mismatch: %s", erk.Error())
+						applog.Debug("static-kratos-auth: auth-token mismatch", "reason", erk.Error())
 					}
 					return nil, erk
 				}
@@ -289,29 +284,29 @@ func middlewareFunc(cfg *Config, logger log.Logger) middleware.Middleware {
 //
 // checkAuthToken 根据启用的令牌映射验证令牌
 // 成功返回用户名，失败返回错误
-func checkAuthToken(cfg *Config, mapBox *authTokenMapBox, token string, slog *log.Helper) (string, *errors.Error) {
+func checkAuthToken(cfg *Config, mapBox *authTokenMapBox, token string, applog *slog.Logger) (string, *errors.Error) {
 	if !cfg.simpleEnable && !cfg.bearerEnable && !cfg.base64Enable {
 		if cfg.debugMode {
-			slog.Debugf("static-kratos-auth: check token (no token types enabled, must enable at least one)")
+			applog.Debug("static-kratos-auth: check token (no token types enabled, must enable at least one)")
 		}
 		return "", errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: no token type enabled")
 	}
 
 	if username, ok := mapBox.simpleTokenMap[token]; ok {
 		if cfg.debugMode {
-			slog.Debugf("static-kratos-auth: simple-type request username:%v quick pass", username)
+			applog.Debug("static-kratos-auth: simple-type request quick pass", "username", username)
 		}
 		return username, nil
 	}
 	if username, ok := mapBox.bearerTokenMap[token]; ok {
 		if cfg.debugMode {
-			slog.Debugf("static-kratos-auth: bearer-type request username:%v quick pass", username)
+			applog.Debug("static-kratos-auth: bearer-type request quick pass", "username", username)
 		}
 		return username, nil
 	}
 	if username, ok := mapBox.base64TokenMap[token]; ok {
 		if cfg.debugMode {
-			slog.Debugf("static-kratos-auth: base64-type request username:%v quick pass", username)
+			applog.Debug("static-kratos-auth: base64-type request quick pass", "username", username)
 		}
 		return username, nil
 	}
