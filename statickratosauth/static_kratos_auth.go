@@ -11,7 +11,6 @@ package statickratosauth
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -24,7 +23,6 @@ import (
 	"github.com/yylego/kratos-auth/authkratos"
 	"github.com/yylego/kratos-static-auth/internal/utils"
 	"github.com/yylego/must"
-	"github.com/yylego/neatjson/neatjsons"
 )
 
 // Config holds authentication middleware configuration
@@ -33,21 +31,19 @@ import (
 // Config 认证中间件配置
 // 包含路由范围、令牌映射和启用的令牌类型
 type Config struct {
-	routeScope   *authkratos.RouteScope       // Route scope config // 路由范围配置
-	authTokens   map[string]string            // Username to token map // 用户名到令牌的映射
-	fieldName    string                       // Request field name // 请求头字段名
-	spanHooks    []authkratos.NewSpanHookFunc // Span hooks for tracing // 追踪 span hooks
-	debugMode    bool                         // Debug mode flag // 调试模式标志
-	simpleEnable bool                         // Enable simple token type // 启用简单令牌类型
-	bearerEnable bool                         // Enable Bearer token type // 启用 Bearer 令牌类型
-	base64Enable bool                         // Enable Base64 Basic Auth type // 启用 Base64 Basic Auth 类型
+	routeScope   *authkratos.RouteScope // Route scope config // 路由范围配置
+	authTokens   map[string]string      // Username to token map // 用户名到令牌的映射
+	fieldName    string                 // Request field name // 请求头字段名
+	simpleEnable bool                   // Enable simple token type // 启用简单令牌类型
+	bearerEnable bool                   // Enable Bearer token type // 启用 Bearer 令牌类型
+	base64Enable bool                   // Enable Base64 Basic Auth type // 启用 Base64 Basic Auth 类型
 }
 
 // NewConfig creates a new Config with route scope and token map
-// Default: field name "Authorization", tracing disabled, debug mode defaults to false
+// Default: field name "Authorization", no token type enabled yet
 //
 // NewConfig 创建新的配置，包含路由范围和令牌映射
-// 默认字段名 "Authorization"，追踪禁用，调试模式默认关闭
+// 默认字段名 "Authorization"，还没有启用任何令牌类型
 func NewConfig(
 	routeScope *authkratos.RouteScope,
 	authTokens map[string]string,
@@ -63,7 +59,6 @@ func NewConfig(
 		routeScope: routeScope,
 		authTokens: authTokens,
 		fieldName:  "Authorization",
-		debugMode:  false,
 	}
 }
 
@@ -86,23 +81,6 @@ func (c *Config) WithFieldName(fieldName string) *Config {
 // GetFieldName 获取请求头中用于认证的字段名
 func (c *Config) GetFieldName() string {
 	return c.fieldName
-}
-
-// WithDebugMode sets debug mode flag
-// When enabled, outputs detailed auth logs
-//
-// WithDebugMode 设置调试模式标志
-// 启用时输出详细的认证日志
-func (c *Config) WithDebugMode(debugMode bool) *Config {
-	c.debugMode = debugMode
-	return c
-}
-
-// WithNewSpanHook appends a span hook, supports chaining
-// WithNewSpanHook 追加一个 span hook，支持链式调用
-func (c *Config) WithNewSpanHook(fn authkratos.NewSpanHookFunc) *Config {
-	c.spanHooks = append(c.spanHooks, fn)
-	return c
 }
 
 // WithSimpleEnable enables simple token type authentication
@@ -179,23 +157,38 @@ func (c *Config) RandomBase64Token() string {
 
 // NewMiddleware creates authentication middleware with config and logger
 // Uses selector.Server to match routes and check auth tokens
+// Panics when no token type is enabled, and also when a username comes with a blank token
+// Each match and each auth outcome goes to applog at debug level, so the level of applog decides if it shows
 //
 // NewMiddleware 使用配置和日志创建认证中间件
 // 使用 selector.Server 匹配路由并检查认证令牌
+// 没有启用任何令牌类型、或有用户的令牌为空时 panic
+// 每次匹配和每次认证结果都以 debug 级别写进 applog，显示与否由 applog 的日志级别决定
 func NewMiddleware(cfg *Config, applog *slog.Logger) middleware.Middleware {
+	// A wrong config shows up at startup, not as 401 on each request
+	// 配置写错在启动时就暴露，而不是每个请求都返回 401
+	if !cfg.simpleEnable && !cfg.bearerEnable && !cfg.base64Enable {
+		panic(fmt.Errorf("static-kratos-auth: no token type enabled, enable one with WithSimpleEnable, WithBearerEnable, WithBase64Enable"))
+	}
+	for username, token := range cfg.authTokens {
+		// A blank token lets "Basic base64(username:)" pass, which is a login with no password
+		// 空令牌会让 "Basic base64(用户名:)" 通过，等于不用密码就能登录
+		if token == "" {
+			panic(fmt.Errorf("static-kratos-auth: username %q has a blank token", username))
+		}
+	}
+
 	applog.Info(
 		"static-kratos-auth: new middleware",
 		"field-name", cfg.fieldName,
 		"auth-tokens", len(cfg.authTokens),
 		"side", cfg.routeScope.Side,
 		"operations", len(cfg.routeScope.OperationSet),
-		"simple-enable", authkratos.BooleanToNum(cfg.simpleEnable),
-		"bearer-enable", authkratos.BooleanToNum(cfg.bearerEnable),
-		"base64-enable", authkratos.BooleanToNum(cfg.base64Enable),
+		"simple-enable", cfg.simpleEnable,
+		"bearer-enable", cfg.bearerEnable,
+		"base64-enable", cfg.base64Enable,
 	)
-	if cfg.debugMode {
-		applog.Debug("static-kratos-auth: new middleware route-scope", "field-name", cfg.fieldName, "route-scope", neatjsons.S(cfg.routeScope))
-	}
+	applog.Debug("static-kratos-auth: new middleware route-scope", "route-scope", cfg.routeScope)
 	return selector.Server(middlewareFunc(cfg, applog)).Match(matchFunc(cfg, applog)).Build()
 }
 
@@ -206,18 +199,8 @@ func NewMiddleware(cfg *Config, applog *slog.Logger) middleware.Middleware {
 // 操作需要认证时返回 true
 func matchFunc(cfg *Config, applog *slog.Logger) selector.MatchFunc {
 	return func(ctx context.Context, operation string) bool {
-		// Start tracing spans via configured hooks
-		// 通过配置的 hooks 启动追踪 spans
-		defer authkratos.RunSpanHooks(ctx, cfg.spanHooks, "static-kratos-auth-match")()
-
 		match := cfg.routeScope.Match(operation)
-		if cfg.debugMode {
-			if match {
-				applog.Debug("static-kratos-auth: match next -> check auth", "operation", operation, "side", cfg.routeScope.Side, "match", authkratos.BooleanToNum(match))
-			} else {
-				applog.Debug("static-kratos-auth: match skip -- check auth", "operation", operation, "side", cfg.routeScope.Side, "match", authkratos.BooleanToNum(match))
-			}
-		}
+		applog.Debug("static-kratos-auth: route match", "operation", operation, "side", cfg.routeScope.Side, "match", match)
 		return match
 	}
 }
@@ -246,35 +229,27 @@ func middlewareFunc(cfg *Config, applog *slog.Logger) middleware.Middleware {
 	}
 
 	return func(handleFunc middleware.Handler) middleware.Handler {
-		return func(ctx context.Context, req interface{}) (interface{}, error) {
-			if tsp, ok := transport.FromServerContext(ctx); ok {
-				// Start tracing spans via configured hooks
-				// 通过配置的 hooks 启动追踪 spans
-				defer authkratos.RunSpanHooks(ctx, cfg.spanHooks, "static-kratos-auth")()
-
-				var authToken = tsp.RequestHeader().Get(cfg.fieldName)
-				if authToken == "" {
-					if cfg.debugMode {
-						applog.Debug("static-kratos-auth: auth-token is missing")
-					}
-					return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: auth-token is missing")
-				}
-				username, erk := checkAuthToken(cfg, mapBox, authToken, applog)
-				if erk != nil {
-					if cfg.debugMode {
-						applog.Debug("static-kratos-auth: auth-token mismatch", "reason", erk.Error())
-					}
-					return nil, erk
-				}
-				// Auth success, inject username into context
-				// Business code can get username via GetUsername(ctx)
-				//
-				// 认证成功，将用户名注入 context
-				// 业务代码可通过 GetUsername(ctx) 获取用户名
-				ctx = SetUsername(ctx, username)
-				return handleFunc(ctx, req)
+		return func(ctx context.Context, req any) (any, error) {
+			tsp, ok := transport.FromServerContext(ctx)
+			if !ok {
+				return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: wrong context")
 			}
-			return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: wrong context")
+			authToken := tsp.RequestHeader().Get(cfg.fieldName)
+			if authToken == "" {
+				applog.Debug("static-kratos-auth: auth-token is missing")
+				return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: auth-token is missing")
+			}
+			username, erk := checkAuthToken(mapBox, authToken, applog)
+			if erk != nil {
+				applog.Debug("static-kratos-auth: auth-token mismatch", "reason", erk.Error())
+				return nil, erk
+			}
+			// Auth success, inject username into context
+			// Business code can get username via GetUsername(ctx)
+			//
+			// 认证成功，将用户名注入 context
+			// 业务代码可通过 GetUsername(ctx) 获取用户名
+			return handleFunc(SetUsername(ctx, username), req)
 		}
 	}
 }
@@ -284,30 +259,17 @@ func middlewareFunc(cfg *Config, applog *slog.Logger) middleware.Middleware {
 //
 // checkAuthToken 根据启用的令牌映射验证令牌
 // 成功返回用户名，失败返回错误
-func checkAuthToken(cfg *Config, mapBox *authTokenMapBox, token string, applog *slog.Logger) (string, *errors.Error) {
-	if !cfg.simpleEnable && !cfg.bearerEnable && !cfg.base64Enable {
-		if cfg.debugMode {
-			applog.Debug("static-kratos-auth: check token (no token types enabled, must enable at least one)")
-		}
-		return "", errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: no token type enabled")
-	}
-
+func checkAuthToken(mapBox *authTokenMapBox, token string, applog *slog.Logger) (string, *errors.Error) {
 	if username, ok := mapBox.simpleTokenMap[token]; ok {
-		if cfg.debugMode {
-			applog.Debug("static-kratos-auth: simple-type request quick pass", "username", username)
-		}
+		applog.Debug("static-kratos-auth: simple-type request quick pass", "username", username)
 		return username, nil
 	}
 	if username, ok := mapBox.bearerTokenMap[token]; ok {
-		if cfg.debugMode {
-			applog.Debug("static-kratos-auth: bearer-type request quick pass", "username", username)
-		}
+		applog.Debug("static-kratos-auth: bearer-type request quick pass", "username", username)
 		return username, nil
 	}
 	if username, ok := mapBox.base64TokenMap[token]; ok {
-		if cfg.debugMode {
-			applog.Debug("static-kratos-auth: base64-type request quick pass", "username", username)
-		}
+		applog.Debug("static-kratos-auth: base64-type request quick pass", "username", username)
 		return username, nil
 	}
 	return "", errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: auth-token mismatch")
@@ -358,8 +320,7 @@ func newBearerTokenMap(usernameToTokenMap map[string]string) map[string]string {
 func newBase64TokenMap(usernameToTokenMap map[string]string) map[string]string {
 	base64TypeToUsername := make(map[string]string, len(usernameToTokenMap))
 	for username, token := range usernameToTokenMap {
-		encoded := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, token)))
-		base64TypeToUsername["Basic "+encoded] = username
+		base64TypeToUsername[utils.BasicAuth(username, token)] = username
 	}
 	return base64TypeToUsername
 }
@@ -369,35 +330,19 @@ func newBase64TokenMap(usernameToTokenMap map[string]string) map[string]string {
 // usernameKey 是用于存储用户名的 context key 类型
 type usernameKey struct{}
 
-// SetUsernameIntoContext injects username into context
-// Use on auth success to pass username in request context
+// SetUsername puts the username into the context
+// The middleware calls it on auth success, so business code can read the username with GetUsername
 //
-// SetUsernameIntoContext 将用户名注入 context
-// 认证成功后调用，在请求上下文中传递用户信息
-func SetUsernameIntoContext(ctx context.Context, username string) context.Context {
+// SetUsername 把用户名放进 context
+// 认证成功时中间件会调用它，业务代码再用 GetUsername 取出用户名
+func SetUsername(ctx context.Context, username string) context.Context {
 	return context.WithValue(ctx, usernameKey{}, username)
 }
 
-// GetUsernameFromContext gets username from context
-// Returns username and existence flag
+// GetUsername reads the username from the context, with a flag that tells if it is there
 //
-// GetUsernameFromContext 从 context 获取用户名
-// 返回用户名和是否存在的标志
-func GetUsernameFromContext(ctx context.Context) (string, bool) {
+// GetUsername 从 context 取出用户名，并返回是否取到
+func GetUsername(ctx context.Context) (string, bool) {
 	username, ok := ctx.Value(usernameKey{}).(string)
 	return username, ok
-}
-
-// SetUsername is alias to SetUsernameIntoContext
-//
-// SetUsername 是 SetUsernameIntoContext 的别名
-func SetUsername(ctx context.Context, username string) context.Context {
-	return SetUsernameIntoContext(ctx, username)
-}
-
-// GetUsername is alias to GetUsernameFromContext
-//
-// GetUsername 是 GetUsernameFromContext 的别名
-func GetUsername(ctx context.Context) (string, bool) {
-	return GetUsernameFromContext(ctx)
 }

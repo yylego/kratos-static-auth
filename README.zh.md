@@ -1,9 +1,13 @@
+<!-- TEMPLATE (ZH) BEGIN: BADGES -->
+
 [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/yylego/kratos-static-auth/release.yml?branch=main&label=BUILD)](https://github.com/yylego/kratos-static-auth/actions/workflows/release.yml?query=branch%3Amain)
 [![GoDoc](https://pkg.go.dev/badge/github.com/yylego/kratos-static-auth)](https://pkg.go.dev/github.com/yylego/kratos-static-auth)
 [![Coverage Status](https://img.shields.io/coveralls/github/yylego/kratos-static-auth/main.svg)](https://coveralls.io/github/yylego/kratos-static-auth?branch=main)
-[![Supported Go Versions](https://img.shields.io/badge/Go-1.25+-lightgrey.svg)](https://go.dev/)
+[![Supported Go Versions](https://img.shields.io/badge/Go-1.26%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/kratos-static-auth.svg)](https://github.com/yylego/kratos-static-auth/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/kratos-static-auth)](https://goreportcard.com/report/github.com/yylego/kratos-static-auth)
+
+<!-- TEMPLATE (ZH) CLOSE: BADGES -->
 
 # kratos-static-auth
 
@@ -17,15 +21,15 @@
 
 [ENGLISH README](README.md)
 
-<!-- TEMPLATE (ZH) END: LANGUAGE NAVIGATION -->
+<!-- TEMPLATE (ZH) CLOSE: LANGUAGE NAVIGATION -->
 
 ## 核心特性
 
-🗺️ **令牌映射**: 基于预配置的用户名-令牌映射表进行认证
-🔑 **多种格式**: 支持简单令牌、Bearer 令牌和 Base64 Basic Auth
-👤 **用户名注入**: 认证成功后自动将用户名注入请求上下文
-📡 **APM 追踪**: 通过 `authkratos.SpanHook` 进行可插拔的 span 钩子集成
-⚙️ **路由范围**: 基于路由范围配置的选择性认证
+- 🗺️ **令牌映射**: 基于预配置的用户名-令牌映射表进行认证
+- 🔑 **多种格式**: 支持简单令牌、Bearer 令牌和 Base64 Basic Auth
+- 👤 **用户名注入**: 认证成功后自动将用户名注入请求上下文
+- 🪵 **调试日志**: 每次路由匹配和认证结果以 debug 级别写进日志，显示与否由日志级别决定
+- ⚙️ **路由范围**: 基于路由范围配置的选择性认证
 
 ## 安装
 
@@ -36,14 +40,48 @@ go get github.com/yylego/kratos-static-auth
 ## 使用方法
 
 ```go
-import "github.com/yylego/kratos-static-auth/statickratosauth"
+package server
 
-tokens := map[string]string{"admin": "secret-token-123"}
-cfg := statickratosauth.NewConfig(routeScope, tokens).
-    WithSimpleEnable().
-    WithBearerEnable().
-    WithBase64Enable()
-mw := statickratosauth.NewMiddleware(cfg, logger)
+import (
+    "log/slog"
+
+    "github.com/go-kratos/kratos/v3/transport/http"
+    "github.com/yylego/kratos-auth/authkratos"
+    "github.com/yylego/kratos-static-auth/statickratosauth"
+)
+
+func NewHTTPServer(applog *slog.Logger) *http.Server {
+    // 除了公开的 ping，其余接口都要认证
+    routeScope := authkratos.NewExclude("/api.v1.Demo/Ping")
+    // 用户名 -> 令牌
+    tokens := map[string]string{"admin": "secret-token-123"}
+
+    cfg := statickratosauth.NewConfig(routeScope, tokens).
+        WithSimpleEnable(). // Authorization: secret-token-123
+        WithBearerEnable(). // Authorization: Bearer secret-token-123
+        WithBase64Enable()  // Authorization: Basic base64(admin:secret-token-123)
+
+    return http.NewServer(
+        http.Middleware(statickratosauth.NewMiddleware(cfg, applog)),
+    )
+}
+```
+
+配置写错时 `NewMiddleware` 在启动时就 panic，不会等到每个请求都返回 401 才发现：
+
+- 没有启用任何令牌类型：至少调用 `WithSimpleEnable`、`WithBearerEnable`、`WithBase64Enable` 中的一个。
+- 有用户的令牌为空：否则 `Basic base64(admin:)` 就能通过，等于不用密码就能登录。
+
+### 在业务代码中获取用户名
+
+```go
+func (s *DemoService) Admin(ctx context.Context, req *pb.AdminRequest) (*pb.AdminReply, error) {
+    username, ok := statickratosauth.GetUsername(ctx) // 令牌所属的用户
+    if !ok {
+        return nil, errors.Unauthorized("UNAUTHORIZED", "no username in context")
+    }
+    return &pb.AdminReply{Message: "hello " + username}, nil
+}
 ```
 
 ---
@@ -106,10 +144,4 @@ MIT 许可证 - 详见 [LICENSE](LICENSE)。
 
 **祝你用这个包编程愉快！** 🎉🎉🎉
 
-<!-- TEMPLATE (ZH) END: STANDARD PROJECT FOOTER -->
-
----
-
-## GitHub 标星点赞
-
-[![标星点赞](https://starchart.cc/yylego/kratos-static-auth.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-static-auth)
+<!-- TEMPLATE (ZH) CLOSE: STANDARD PROJECT FOOTER -->

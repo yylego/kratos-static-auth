@@ -1,9 +1,13 @@
+<!-- TEMPLATE (EN) BEGIN: BADGES -->
+
 [![GitHub Workflow Status (branch)](https://img.shields.io/github/actions/workflow/status/yylego/kratos-static-auth/release.yml?branch=main&label=BUILD)](https://github.com/yylego/kratos-static-auth/actions/workflows/release.yml?query=branch%3Amain)
 [![GoDoc](https://pkg.go.dev/badge/github.com/yylego/kratos-static-auth)](https://pkg.go.dev/github.com/yylego/kratos-static-auth)
 [![Coverage Status](https://img.shields.io/coveralls/github/yylego/kratos-static-auth/main.svg)](https://coveralls.io/github/yylego/kratos-static-auth?branch=main)
-[![Supported Go Versions](https://img.shields.io/badge/Go-1.25+-lightgrey.svg)](https://go.dev/)
+[![Supported Go Versions](https://img.shields.io/badge/Go-1.26%2B-lightgrey.svg)](https://go.dev/)
 [![GitHub Release](https://img.shields.io/github/release/yylego/kratos-static-auth.svg)](https://github.com/yylego/kratos-static-auth/releases)
 [![Go Report Card](https://goreportcard.com/badge/github.com/yylego/kratos-static-auth)](https://goreportcard.com/report/github.com/yylego/kratos-static-auth)
+
+<!-- TEMPLATE (EN) CLOSE: BADGES -->
 
 # kratos-static-auth
 
@@ -17,15 +21,15 @@ Static token authentication middleware with pre-configured username-token mappin
 
 [中文说明](README.zh.md)
 
-<!-- TEMPLATE (EN) END: LANGUAGE NAVIGATION -->
+<!-- TEMPLATE (EN) CLOSE: LANGUAGE NAVIGATION -->
 
 ## Main Features
 
-🗺️ **Token Mapping**: Pre-configured username-to-token map based authentication
-🔑 **Multiple Formats**: Supports simple tokens, Bearer tokens, and Base64 Basic Auth
-👤 **Username Injection**: Auto-injects authenticated username into request context
-📡 **APM Tracing**: Pluggable span hook integration via `authkratos.SpanHook`
-⚙️ **Route Scope**: Selective authentication based on route scope configuration
+- 🗺️ **Token Mapping**: Pre-configured username-to-token map based authentication
+- 🔑 **Multiple Formats**: Supports simple tokens, Bearer tokens, and Base64 Basic Auth
+- 👤 **Username Injection**: Auto-injects authenticated username into request context
+- 🪵 **Debug Logs**: Each route match and auth outcome goes to the logger at debug level, and the logger level decides if it shows
+- ⚙️ **Route Scope**: Selective authentication based on route scope configuration
 
 ## Installation
 
@@ -36,14 +40,48 @@ go get github.com/yylego/kratos-static-auth
 ## Usage
 
 ```go
-import "github.com/yylego/kratos-static-auth/statickratosauth"
+package server
 
-tokens := map[string]string{"admin": "secret-token-123"}
-cfg := statickratosauth.NewConfig(routeScope, tokens).
-    WithSimpleEnable().
-    WithBearerEnable().
-    WithBase64Enable()
-mw := statickratosauth.NewMiddleware(cfg, logger)
+import (
+    "log/slog"
+
+    "github.com/go-kratos/kratos/v3/transport/http"
+    "github.com/yylego/kratos-auth/authkratos"
+    "github.com/yylego/kratos-static-auth/statickratosauth"
+)
+
+func NewHTTPServer(applog *slog.Logger) *http.Server {
+    // Check each route except the public ping
+    routeScope := authkratos.NewExclude("/api.v1.Demo/Ping")
+    // Username -> token
+    tokens := map[string]string{"admin": "secret-token-123"}
+
+    cfg := statickratosauth.NewConfig(routeScope, tokens).
+        WithSimpleEnable(). // Authorization: secret-token-123
+        WithBearerEnable(). // Authorization: Bearer secret-token-123
+        WithBase64Enable()  // Authorization: Basic base64(admin:secret-token-123)
+
+    return http.NewServer(
+        http.Middleware(statickratosauth.NewMiddleware(cfg, applog)),
+    )
+}
+```
+
+`NewMiddleware` panics at startup on a wrong config, so it does not wait to show up as 401 on each request:
+
+- No token type is enabled: enable at least one with `WithSimpleEnable`, `WithBearerEnable`, `WithBase64Enable`.
+- A username has a blank token: it would let `Basic base64(admin:)` pass, which is a login with no password.
+
+### Get the Username in Business Code
+
+```go
+func (s *DemoService) Admin(ctx context.Context, req *pb.AdminRequest) (*pb.AdminReply, error) {
+    username, ok := statickratosauth.GetUsername(ctx) // the username the token belongs to
+    if !ok {
+        return nil, errors.Unauthorized("UNAUTHORIZED", "no username in context")
+    }
+    return &pb.AdminReply{Message: "hello " + username}, nil
+}
 ```
 
 ---
@@ -106,10 +144,4 @@ Welcome to contribute to this project via submitting merge requests and reportin
 
 **Have Fun Coding with this package!** 🎉🎉🎉
 
-<!-- TEMPLATE (EN) END: STANDARD PROJECT FOOTER -->
-
----
-
-## GitHub Stars
-
-[![Stargazers](https://starchart.cc/yylego/kratos-static-auth.svg?variant=adaptive)](https://starchart.cc/yylego/kratos-static-auth)
+<!-- TEMPLATE (EN) CLOSE: STANDARD PROJECT FOOTER -->

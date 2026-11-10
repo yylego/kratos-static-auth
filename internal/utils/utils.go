@@ -3,10 +3,6 @@ package utils
 import (
 	"encoding/base64"
 	"math/rand/v2"
-	"net"
-	"net/url"
-
-	"github.com/yylego/must"
 )
 
 func BasicEncode(username, password string) string {
@@ -22,17 +18,4 @@ func Sample[T any](a []T) (res T) {
 		res = a[rand.IntN(len(a))]
 	}
 	return res
-}
-
-func BooleanToNum(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
-}
-
-func ExtractPort(endpoint *url.URL) string {
-	must.Full(endpoint)
-	_, port, _ := net.SplitHostPort(must.Nice(endpoint.Host))
-	return must.Nice(port)
 }
