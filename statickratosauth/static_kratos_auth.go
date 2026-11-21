@@ -1,6 +1,6 @@
 // Package statickratosauth: Static token authentication middleware
 // Provides out-of-box auth with username-token map and various token format support
-// Supports simple tokens, authorization tokens, and Base64-encoded Basic Auth
+// Supports simple tokens, Bearer tokens, and Base64-encoded Basic Auth
 // Auto-injects authenticated username into request context
 //
 // statickratosauth: 静态令牌认证中间件
@@ -25,6 +25,13 @@ import (
 	"github.com/yylego/must"
 )
 
+// NewErkFunc builds the error the middleware responds with
+// It runs on each request that hits the case, so it is the place to write a log when one is wanted
+//
+// NewErkFunc 构造中间件要返回的错误
+// 每个走到这一步的请求都会调用它，想记日志就写在这里面
+type NewErkFunc func(ctx context.Context) *errors.Error
+
 // Config holds authentication middleware configuration
 // Includes route scope, token map, and enabled token types
 //
@@ -37,6 +44,8 @@ type Config struct {
 	simpleEnable bool                   // Enable simple token type // 启用简单令牌类型
 	bearerEnable bool                   // Enable Bearer token type // 启用 Bearer 令牌类型
 	base64Enable bool                   // Enable Base64 Basic Auth type // 启用 Base64 Basic Auth 类型
+	missingErk   NewErkFunc             // Builds the response when the token is missing, unset means the default 401 UNAUTHORIZED // 没带令牌时构造返回的错误，不设置就用默认的 401 UNAUTHORIZED
+	invalidErk   NewErkFunc             // Builds the response when the token matches nothing, unset means the default 401 UNAUTHORIZED // 令牌对不上时构造返回的错误，不设置就用默认的 401 UNAUTHORIZED
 }
 
 // NewConfig creates a new Config with route scope and token map
@@ -49,13 +58,6 @@ func NewConfig(
 	authTokens map[string]string,
 ) *Config {
 	return &Config{
-		// Avoid non-standard field names
-		// Nginx ignores names with underscores unless underscores_in_headers is on
-		// Recommend avoiding names with non-standard chars
-		//
-		// 避免非标准字段名
-		// Nginx 默认忽略带下划线的 headers，除非配置 underscores_in_headers on
-		// 建议不用含特殊字符的字段名
 		routeScope: routeScope,
 		authTokens: authTokens,
 		fieldName:  "Authorization",
@@ -76,10 +78,10 @@ func (c *Config) WithFieldName(fieldName string) *Config {
 	return c
 }
 
-// GetFieldName gets request field name used in authentication
+// FieldName returns the request field name used in authentication
 //
-// GetFieldName 获取请求头中用于认证的字段名
-func (c *Config) GetFieldName() string {
+// FieldName 返回请求头中用于认证的字段名
+func (c *Config) FieldName() string {
 	return c.fieldName
 }
 
@@ -113,24 +115,44 @@ func (c *Config) WithBase64Enable() *Config {
 	return c
 }
 
-// GetSimpleTokens returns username to token map
+// WithMissingErk sets the function that builds the response when a request inside the scope brings no token
+// Without it the middleware responds 401 UNAUTHORIZED
+//
+// WithMissingErk 设置范围内的请求没带令牌时用来构造错误的函数
+// 不设置时中间件返回 401 UNAUTHORIZED
+func (c *Config) WithMissingErk(newErk NewErkFunc) *Config {
+	c.missingErk = newErk
+	return c
+}
+
+// WithInvalidErk sets the function that builds the response when the token matches none of the configured tokens
+// Without it the middleware responds 401 UNAUTHORIZED
+//
+// WithInvalidErk 设置令牌跟配置的令牌都对不上时用来构造错误的函数
+// 不设置时中间件返回 401 UNAUTHORIZED
+func (c *Config) WithInvalidErk(newErk NewErkFunc) *Config {
+	c.invalidErk = newErk
+	return c
+}
+
+// SimpleTokens returns username to token map
 // Returns nil if Config is nil
 //
-// GetSimpleTokens 返回用户名到令牌的映射
+// SimpleTokens 返回用户名到令牌的映射
 // Config 为 nil 时返回 nil
-func (c *Config) GetSimpleTokens() map[string]string {
+func (c *Config) SimpleTokens() map[string]string {
 	if c != nil {
 		return c.authTokens
 	}
 	return nil
 }
 
-// GetBase64Tokens returns username to Basic Auth token map
+// Base64Tokens returns username to Basic Auth token map
 //
-// GetBase64Tokens 返回用户名到 Basic Auth 令牌的映射
-func (c *Config) GetBase64Tokens() map[string]string {
-	var res = make(map[string]string, len(c.GetSimpleTokens()))
-	for username, password := range c.GetSimpleTokens() {
+// Base64Tokens 返回用户名到 Basic Auth 令牌的映射
+func (c *Config) Base64Tokens() map[string]string {
+	var res = make(map[string]string, len(c.SimpleTokens()))
+	for username, password := range c.SimpleTokens() {
 		res[username] = utils.BasicAuth(username, password)
 	}
 	return res
@@ -142,7 +164,7 @@ func (c *Config) GetBase64Tokens() map[string]string {
 // LookupBase64Token 根据用户名挑选 Basic Auth 令牌
 // 用户名不存在时 panic
 func (c *Config) LookupBase64Token(username string) string {
-	password, ok := c.GetSimpleTokens()[username]
+	password, ok := c.SimpleTokens()[username]
 	must.TRUE(ok)
 	must.Nice(password)
 	return utils.BasicAuth(username, password)
@@ -152,17 +174,19 @@ func (c *Config) LookupBase64Token(username string) string {
 //
 // RandomBase64Token 从令牌映射中随机返回一个 Basic Auth 令牌
 func (c *Config) RandomBase64Token() string {
-	return c.LookupBase64Token(utils.Sample(slices.Collect(maps.Keys(c.GetSimpleTokens()))))
+	return c.LookupBase64Token(utils.Sample(slices.Collect(maps.Keys(c.SimpleTokens()))))
 }
 
-// NewMiddleware creates authentication middleware with config and logger
-// Uses selector.Server to match routes and check auth tokens
-// Panics when no token type is enabled, and also when a username comes with a blank token
+// NewMiddleware creates the auth middleware: routes inside the scope need a token that matches one of the configured tokens in an enabled format
+// A missing token and a token that matches nothing get 401 UNAUTHORIZED (change them with WithMissingErk and WithInvalidErk), routes outside the scope pass through
+// On success the username goes into the context, to read with FromContext
+// Panics on a wrong config: no token type enabled, a username with a blank token, two usernames sharing one token (exempt when Basic Auth is the one type enabled)
 // Each match and each auth outcome goes to applog at debug level, so the level of applog decides if it shows
 //
-// NewMiddleware 使用配置和日志创建认证中间件
-// 使用 selector.Server 匹配路由并检查认证令牌
-// 没有启用任何令牌类型、或有用户的令牌为空时 panic
+// NewMiddleware 创建认证中间件：范围内的路由要带令牌，并且按已启用的格式跟配置的某个令牌对上
+// 没带令牌、令牌对不上都返回 401 UNAUTHORIZED（可用 WithMissingErk、WithInvalidErk 换成别的错误），范围外的路由直接放行
+// 认证成功后用户名放进 context，用 FromContext 取出
+// 配置写错时 panic：没有启用任何令牌类型、有用户的令牌为空、启用简单令牌或 Bearer 令牌时两个用户共用一个令牌
 // 每次匹配和每次认证结果都以 debug 级别写进 applog，显示与否由 applog 的日志级别决定
 func NewMiddleware(cfg *Config, applog *slog.Logger) middleware.Middleware {
 	// A wrong config shows up at startup, not as 401 on each request
@@ -175,6 +199,21 @@ func NewMiddleware(cfg *Config, applog *slog.Logger) middleware.Middleware {
 		// 空令牌会让 "Basic base64(用户名:)" 通过，等于不用密码就能登录
 		if token == "" {
 			panic(fmt.Errorf("static-kratos-auth: username %q has a blank token", username))
+		}
+	}
+	// With the simple and Bearer types the token alone picks the username, so a token shared between two usernames
+	// would map to just one of them, and which one changes from one startup to the next
+	// Basic Auth carries the username, so the same password on two usernames is fine when it is the one type enabled
+	//
+	// 简单令牌和 Bearer 令牌只凭令牌本身找用户，两个用户共用一个令牌时只能对应其中一个，而且每次启动对应到谁并不固定
+	// Basic Auth 自带用户名，只启用它时两个用户密码相同没有问题
+	if cfg.simpleEnable || cfg.bearerEnable {
+		tokenUsernames := make(map[string]string, len(cfg.authTokens))
+		for username, token := range cfg.authTokens {
+			if sameTokenName, ok := tokenUsernames[token]; ok {
+				panic(fmt.Errorf("static-kratos-auth: usernames %q and %q share one token", min(sameTokenName, username), max(sameTokenName, username)))
+			}
+			tokenUsernames[token] = username
 		}
 	}
 
@@ -232,24 +271,30 @@ func middlewareFunc(cfg *Config, applog *slog.Logger) middleware.Middleware {
 		return func(ctx context.Context, req any) (any, error) {
 			tsp, ok := transport.FromServerContext(ctx)
 			if !ok {
-				return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: wrong context")
+				return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: no server transport in the context")
 			}
 			authToken := tsp.RequestHeader().Get(cfg.fieldName)
 			if authToken == "" {
-				applog.Debug("static-kratos-auth: auth-token is missing")
+				applog.Debug("static-kratos-auth: request rejected, auth-token is missing")
+				if cfg.missingErk != nil {
+					return nil, cfg.missingErk(ctx)
+				}
 				return nil, errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: auth-token is missing")
 			}
 			username, erk := checkAuthToken(mapBox, authToken, applog)
 			if erk != nil {
-				applog.Debug("static-kratos-auth: auth-token mismatch", "reason", erk.Error())
+				applog.Debug("static-kratos-auth: request rejected, auth-token mismatch", "reason", erk.Error())
+				if cfg.invalidErk != nil {
+					return nil, cfg.invalidErk(ctx)
+				}
 				return nil, erk
 			}
 			// Auth success, inject username into context
-			// Business code can get username via GetUsername(ctx)
+			// Business code can get username via FromContext(ctx)
 			//
 			// 认证成功，将用户名注入 context
-			// 业务代码可通过 GetUsername(ctx) 获取用户名
-			return handleFunc(SetUsername(ctx, username), req)
+			// 业务代码可通过 FromContext(ctx) 获取用户名
+			return handleFunc(NewContext(ctx, username), req)
 		}
 	}
 }
@@ -261,15 +306,15 @@ func middlewareFunc(cfg *Config, applog *slog.Logger) middleware.Middleware {
 // 成功返回用户名，失败返回错误
 func checkAuthToken(mapBox *authTokenMapBox, token string, applog *slog.Logger) (string, *errors.Error) {
 	if username, ok := mapBox.simpleTokenMap[token]; ok {
-		applog.Debug("static-kratos-auth: simple-type request quick pass", "username", username)
+		applog.Debug("static-kratos-auth: request passed with a simple token", "username", username)
 		return username, nil
 	}
 	if username, ok := mapBox.bearerTokenMap[token]; ok {
-		applog.Debug("static-kratos-auth: bearer-type request quick pass", "username", username)
+		applog.Debug("static-kratos-auth: request passed with a Bearer token", "username", username)
 		return username, nil
 	}
 	if username, ok := mapBox.base64TokenMap[token]; ok {
-		applog.Debug("static-kratos-auth: base64-type request quick pass", "username", username)
+		applog.Debug("static-kratos-auth: request passed with a Basic Auth token", "username", username)
 		return username, nil
 	}
 	return "", errors.Unauthorized("UNAUTHORIZED", "static-kratos-auth: auth-token mismatch")
@@ -330,19 +375,19 @@ func newBase64TokenMap(usernameToTokenMap map[string]string) map[string]string {
 // usernameKey 是用于存储用户名的 context key 类型
 type usernameKey struct{}
 
-// SetUsername puts the username into the context
-// The middleware calls it on auth success, so business code can read the username with GetUsername
+// NewContext puts the username into the context
+// The middleware calls it on auth success, so business code can read the username with FromContext
 //
-// SetUsername 把用户名放进 context
-// 认证成功时中间件会调用它，业务代码再用 GetUsername 取出用户名
-func SetUsername(ctx context.Context, username string) context.Context {
+// NewContext 把用户名放进 context
+// 认证成功时中间件会调用它，业务代码再用 FromContext 取出用户名
+func NewContext(ctx context.Context, username string) context.Context {
 	return context.WithValue(ctx, usernameKey{}, username)
 }
 
-// GetUsername reads the username from the context, with a flag that tells if it is there
+// FromContext reads the username from the context, with a flag that tells if it is there
 //
-// GetUsername 从 context 取出用户名，并返回是否取到
-func GetUsername(ctx context.Context) (string, bool) {
+// FromContext 从 context 取出用户名，并返回是否取到
+func FromContext(ctx context.Context) (string, bool) {
 	username, ok := ctx.Value(usernameKey{}).(string)
 	return username, ok
 }

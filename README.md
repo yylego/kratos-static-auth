@@ -40,8 +40,6 @@ go get github.com/yylego/kratos-static-auth
 ## Usage
 
 ```go
-package server
-
 import (
     "log/slog"
 
@@ -50,7 +48,7 @@ import (
     "github.com/yylego/kratos-static-auth/statickratosauth"
 )
 
-func NewHTTPServer(applog *slog.Logger) *http.Server {
+func newHTTPServer(logger *slog.Logger) *http.Server {
     // Check each route except the public ping
     routeScope := authkratos.NewExclude("/api.v1.Demo/Ping")
     // Username -> token
@@ -62,7 +60,7 @@ func NewHTTPServer(applog *slog.Logger) *http.Server {
         WithBase64Enable()  // Authorization: Basic base64(admin:secret-token-123)
 
     return http.NewServer(
-        http.Middleware(statickratosauth.NewMiddleware(cfg, applog)),
+        http.Middleware(statickratosauth.NewMiddleware(cfg, logger)),
     )
 }
 ```
@@ -71,12 +69,15 @@ func NewHTTPServer(applog *slog.Logger) *http.Server {
 
 - No token type is enabled: enable at least one with `WithSimpleEnable`, `WithBearerEnable`, `WithBase64Enable`.
 - A username has a blank token: it would let `Basic base64(admin:)` pass, which is a login with no password.
+- Two usernames share one token, with at least one of `WithSimpleEnable`, `WithBearerEnable` in use: the token would map to just one of them, and which one changes from one startup to the next. The panic names the two usernames and leaves the token out.
+
+A missing token and a token that matches nothing both get `401 UNAUTHORIZED` as the default. To respond with a custom reason, pass a `func(ctx context.Context) *errors.Error` to each of `WithMissingErk(newErk)` and `WithInvalidErk(newErk)`; write a log inside this function when one is wanted.
 
 ### Get the Username in Business Code
 
 ```go
 func (s *DemoService) Admin(ctx context.Context, req *pb.AdminRequest) (*pb.AdminReply, error) {
-    username, ok := statickratosauth.GetUsername(ctx) // the username the token belongs to
+    username, ok := statickratosauth.FromContext(ctx) // the username the token belongs to
     if !ok {
         return nil, errors.Unauthorized("UNAUTHORIZED", "no username in context")
     }

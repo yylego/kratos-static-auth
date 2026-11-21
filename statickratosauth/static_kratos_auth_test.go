@@ -50,12 +50,12 @@ const (
 // runWithToken 用中间件处理一次请求，返回 handle 函数看到的用户名
 func runWithToken(t *testing.T, cfg *Config, operation string, token string) (string, error) {
 	handle := NewMiddleware(cfg, slog.New(slog.DiscardHandler))(func(ctx context.Context, req any) (any, error) {
-		username, _ := GetUsername(ctx)
+		username, _ := FromContext(ctx)
 		return username, nil
 	})
 	header := mockHeader{}
 	if token != "" {
-		header[cfg.GetFieldName()] = token
+		header[cfg.FieldName()] = token
 	}
 	ctx := transport.NewServerContext(context.Background(), &mockTransport{operation: operation, header: header})
 	reply, err := handle(ctx, nil)
@@ -107,6 +107,44 @@ func TestNewMiddleware(t *testing.T) {
 	})
 }
 
+func TestConfig_WithMissingErk(t *testing.T) {
+	cfg := NewConfig(authkratos.NewInclude(operationAdmin), map[string]string{"admin": "secret-token-123"}).
+		WithSimpleEnable().
+		WithMissingErk(func(ctx context.Context) *errors.Error {
+			return errors.Unauthorized("TOKEN_MISSING", "please sign in")
+		})
+
+	_, err := runWithToken(t, cfg, operationAdmin, "")
+	erk := errors.FromError(err)
+	require.Equal(t, int32(401), erk.Code)
+	require.Equal(t, "TOKEN_MISSING", erk.Reason)
+	require.Equal(t, "please sign in", erk.Message)
+
+	// A wrong token does not go through WithMissingErk
+	// 令牌不对时不走 WithMissingErk
+	_, err = runWithToken(t, cfg, operationAdmin, "not-a-token")
+	require.Equal(t, "UNAUTHORIZED", errors.Reason(err))
+}
+
+func TestConfig_WithInvalidErk(t *testing.T) {
+	cfg := NewConfig(authkratos.NewInclude(operationAdmin), map[string]string{"admin": "secret-token-123"}).
+		WithSimpleEnable().
+		WithInvalidErk(func(ctx context.Context) *errors.Error {
+			return errors.Unauthorized("TOKEN_INVALID", "token invalid")
+		})
+
+	_, err := runWithToken(t, cfg, operationAdmin, "not-a-token")
+	erk := errors.FromError(err)
+	require.Equal(t, int32(401), erk.Code)
+	require.Equal(t, "TOKEN_INVALID", erk.Reason)
+	require.Equal(t, "token invalid", erk.Message)
+
+	// A missing token does not go through WithInvalidErk
+	// 没带令牌时不走 WithInvalidErk
+	_, err = runWithToken(t, cfg, operationAdmin, "")
+	require.Equal(t, "UNAUTHORIZED", errors.Reason(err))
+}
+
 // TestNewMiddleware_SimpleType checks a format that is not enabled does not pass
 // TestNewMiddleware_SimpleType 检查没有启用的格式不能通过
 func TestNewMiddleware_SimpleType(t *testing.T) {
@@ -135,6 +173,35 @@ func TestNewMiddleware_BlankToken(t *testing.T) {
 	})
 }
 
+// TestNewMiddleware_SharedToken checks two usernames with the same token stop the startup
+// The token would map to just one of them, and which one changes from one startup to the next
+//
+// TestNewMiddleware_SharedToken 检查两个用户配了同一个令牌时启动就 panic
+// 否则这个令牌只能对应其中一个用户，而且每次启动对应到谁并不固定
+func TestNewMiddleware_SharedToken(t *testing.T) {
+	tokens := map[string]string{"admin": "same-token-789", "guest": "same-token-789"}
+
+	// The message names the two usernames and leaves the token out
+	// panic 信息点名两个用户，不带令牌本身
+	for _, cfg := range []*Config{
+		NewConfig(authkratos.NewInclude(operationAdmin), tokens).WithSimpleEnable(),
+		NewConfig(authkratos.NewInclude(operationAdmin), tokens).WithBearerEnable(),
+	} {
+		require.PanicsWithError(t, `static-kratos-auth: usernames "admin" and "guest" share one token`, func() {
+			NewMiddleware(cfg, slog.New(slog.DiscardHandler))
+		})
+	}
+
+	// Basic Auth carries the username, so each of the two gets its own name
+	// Basic Auth 自带用户名，两个用户各自认证成自己
+	cfg := NewConfig(authkratos.NewInclude(operationAdmin), tokens).WithBase64Enable()
+	for _, name := range []string{"admin", "guest"} {
+		username, err := runWithToken(t, cfg, operationAdmin, cfg.LookupBase64Token(name))
+		require.NoError(t, err)
+		require.Equal(t, name, username)
+	}
+}
+
 // TestNewMiddleware_NoTypeEnabled checks a config with no token type enabled stops the startup
 // TestNewMiddleware_NoTypeEnabled 检查没有启用任何令牌类型时启动就 panic
 func TestNewMiddleware_NoTypeEnabled(t *testing.T) {
@@ -147,7 +214,7 @@ func TestNewMiddleware_NoTypeEnabled(t *testing.T) {
 
 func TestNewConfig(t *testing.T) {
 	cfg := NewConfig(authkratos.NewInclude(operationAdmin), map[string]string{"admin": "secret-token-123"})
-	require.Equal(t, "Authorization", cfg.GetFieldName())
+	require.Equal(t, "Authorization", cfg.FieldName())
 	require.False(t, cfg.simpleEnable)
 	require.False(t, cfg.bearerEnable)
 	require.False(t, cfg.base64Enable)
@@ -163,10 +230,10 @@ func TestConfig_WithFieldName(t *testing.T) {
 	require.Equal(t, "admin", username)
 }
 
-func TestConfig_GetFieldName(t *testing.T) {
+func TestConfig_FieldName(t *testing.T) {
 	cfg := NewConfig(authkratos.NewInclude(operationAdmin), map[string]string{"admin": "secret-token-123"})
-	require.Equal(t, "Authorization", cfg.GetFieldName())
-	require.Equal(t, "X-Token", cfg.WithFieldName("X-Token").GetFieldName())
+	require.Equal(t, "Authorization", cfg.FieldName())
+	require.Equal(t, "X-Token", cfg.WithFieldName("X-Token").FieldName())
 }
 
 func TestConfig_WithSimpleEnable(t *testing.T) {
@@ -199,17 +266,17 @@ func TestConfig_WithBase64Enable(t *testing.T) {
 	require.True(t, errors.IsUnauthorized(err))
 }
 
-func TestConfig_GetSimpleTokens(t *testing.T) {
+func TestConfig_SimpleTokens(t *testing.T) {
 	tokens := map[string]string{"admin": "secret-token-123"}
-	require.Equal(t, tokens, NewConfig(authkratos.NewInclude(operationAdmin), tokens).GetSimpleTokens())
+	require.Equal(t, tokens, NewConfig(authkratos.NewInclude(operationAdmin), tokens).SimpleTokens())
 
 	var cfg *Config
-	require.Nil(t, cfg.GetSimpleTokens())
+	require.Nil(t, cfg.SimpleTokens())
 }
 
-func TestConfig_GetBase64Tokens(t *testing.T) {
+func TestConfig_Base64Tokens(t *testing.T) {
 	cfg := NewConfig(authkratos.NewInclude(operationAdmin), map[string]string{"admin": "secret-token-123"})
-	require.Equal(t, map[string]string{"admin": "Basic YWRtaW46c2VjcmV0LXRva2VuLTEyMw=="}, cfg.GetBase64Tokens())
+	require.Equal(t, map[string]string{"admin": "Basic YWRtaW46c2VjcmV0LXRva2VuLTEyMw=="}, cfg.Base64Tokens())
 }
 
 func TestConfig_LookupBase64Token(t *testing.T) {
@@ -223,14 +290,14 @@ func TestConfig_RandomBase64Token(t *testing.T) {
 	require.Equal(t, "Basic YWRtaW46c2VjcmV0LXRva2VuLTEyMw==", cfg.RandomBase64Token())
 }
 
-func TestSetUsername(t *testing.T) {
-	username, ok := GetUsername(SetUsername(context.Background(), "admin"))
+func TestNewContext(t *testing.T) {
+	username, ok := FromContext(NewContext(context.Background(), "admin"))
 	require.True(t, ok)
 	require.Equal(t, "admin", username)
 }
 
-func TestGetUsername(t *testing.T) {
-	username, ok := GetUsername(context.Background())
+func TestFromContext(t *testing.T) {
+	username, ok := FromContext(context.Background())
 	require.False(t, ok)
 	require.Equal(t, "", username)
 }
@@ -265,6 +332,6 @@ func TestNewMiddleware_DebugLogs(t *testing.T) {
 	require.Equal(t, `level=INFO msg="static-kratos-auth: new middleware" field-name=Authorization auth-tokens=1 side=INCLUDE operations=1 simple-enable=true bearer-enable=false base64-enable=false
 level=DEBUG msg="static-kratos-auth: new middleware route-scope" route-scope="&{Side:INCLUDE OperationSet:map[/api.v1.Demo/Admin:true]}"
 level=DEBUG msg="static-kratos-auth: route match" operation=/api.v1.Demo/Admin side=INCLUDE match=true
-level=DEBUG msg="static-kratos-auth: simple-type request quick pass" username=admin
+level=DEBUG msg="static-kratos-auth: request passed with a simple token" username=admin
 `, collectLogs(slog.LevelDebug))
 }

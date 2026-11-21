@@ -40,8 +40,6 @@ go get github.com/yylego/kratos-static-auth
 ## 使用方法
 
 ```go
-package server
-
 import (
     "log/slog"
 
@@ -50,7 +48,7 @@ import (
     "github.com/yylego/kratos-static-auth/statickratosauth"
 )
 
-func NewHTTPServer(applog *slog.Logger) *http.Server {
+func newHTTPServer(logger *slog.Logger) *http.Server {
     // 除了公开的 ping，其余接口都要认证
     routeScope := authkratos.NewExclude("/api.v1.Demo/Ping")
     // 用户名 -> 令牌
@@ -62,7 +60,7 @@ func NewHTTPServer(applog *slog.Logger) *http.Server {
         WithBase64Enable()  // Authorization: Basic base64(admin:secret-token-123)
 
     return http.NewServer(
-        http.Middleware(statickratosauth.NewMiddleware(cfg, applog)),
+        http.Middleware(statickratosauth.NewMiddleware(cfg, logger)),
     )
 }
 ```
@@ -71,12 +69,15 @@ func NewHTTPServer(applog *slog.Logger) *http.Server {
 
 - 没有启用任何令牌类型：至少调用 `WithSimpleEnable`、`WithBearerEnable`、`WithBase64Enable` 中的一个。
 - 有用户的令牌为空：否则 `Basic base64(admin:)` 就能通过，等于不用密码就能登录。
+- 启用 `WithSimpleEnable` 或 `WithBearerEnable` 时两个用户共用一个令牌：这个令牌只能对应其中一个用户，而且每次启动对应到谁并不固定。panic 信息点名这两个用户，不带令牌本身。
+
+没带令牌、令牌对不上时，默认都返回 `401 UNAUTHORIZED`。想返回自己的错误码，用 `WithMissingErk(newErk)` 和 `WithInvalidErk(newErk)` 分别传一个 `func(ctx context.Context) *errors.Error`；想记日志就写在这个函数里。
 
 ### 在业务代码中获取用户名
 
 ```go
 func (s *DemoService) Admin(ctx context.Context, req *pb.AdminRequest) (*pb.AdminReply, error) {
-    username, ok := statickratosauth.GetUsername(ctx) // 令牌所属的用户
+    username, ok := statickratosauth.FromContext(ctx) // 令牌所属的用户
     if !ok {
         return nil, errors.Unauthorized("UNAUTHORIZED", "no username in context")
     }
